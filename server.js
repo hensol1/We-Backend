@@ -9,7 +9,20 @@ const app = express();
 const PORT = process.env.PORT || 5000;
 
 app.use(cors({
-  origin: process.env.FRONTEND_URL || 'https://we-one-bay.vercel.app/'
+  origin: function(origin, callback) {
+    const allowedOrigins = [
+      'https://we-one-bay.vercel.app',
+      'https://we-one-bay.vercel.app/', // Notice the trailing slash
+      process.env.FRONTEND_URL
+    ].filter(Boolean); // This removes any undefined or null values
+    
+    if (!origin || allowedOrigins.indexOf(origin) !== -1) {
+      callback(null, true);
+    } else {
+      callback(new Error('Not allowed by CORS'));
+    }
+  },
+  credentials: true
 }));
 app.use(express.json());
 
