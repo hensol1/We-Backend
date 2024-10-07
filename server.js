@@ -3,8 +3,6 @@ const mongoose = require('mongoose');
 const cors = require('cors');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
-const passport = require('passport');
-const GoogleStrategy = require('passport-google-oauth20').Strategy;
 const { OAuth2Client } = require('google-auth-library');
 require('dotenv').config();
 
@@ -12,66 +10,169 @@ const app = express();
 const PORT = process.env.PORT || 5000;
 
 app.use(cors({
-  origin: [
-    'https://we-one-bay.vercel.app',
-    'https://we-h5xdmrhrr-hensol1s-projects.vercel.app',
-    'http://localhost:3000'
-  ],
+  origin: ['http://localhost:3000', 'https://we-one-bay.vercel.app'],
   credentials: true
 }));
 
 app.use(express.json());
-app.use(passport.initialize());
 
-// MongoDB connection
 mongoose.connect(process.env.MONGODB_URI, {
   useNewUrlParser: true,
   useUnifiedTopology: true,
   dbName: 'we'
 })
-.then(() => console.log('MongoDB connected to "we" database'))
+.then(() => console.log('MongoDB connected'))
 .catch(err => console.log('MongoDB connection error:', err));
 
-// Updated User Schema
 const userSchema = new mongoose.Schema({
   username: { type: String, required: true, unique: true },
-  email: { type: String, required: function() { return this.googleId != null; }, unique: true, sparse: true },
-  password: { type: String, required: function() { return this.googleId == null; } },
+  email: { type: String, sparse: true },
+  password: { type: String },
   country: { type: String, required: true },
   isAdmin: { type: Boolean, default: false },
   votes: [{
     matchId: String,
     vote: String
   }],
-  googleId: { type: String, unique: true, sparse: true }
+  googleId: { type: String, sparse: true }
 });
 
 const User = mongoose.model('User', userSchema);
 
-// Configure Passport Google Strategy
-passport.use(new GoogleStrategy({
-    clientID: process.env.GOOGLE_CLIENT_ID,
-    clientSecret: process.env.GOOGLE_CLIENT_SECRET,
-    callbackURL: "/auth/google/callback"
-  },
-  async (accessToken, refreshToken, profile, done) => {
-    try {
-      let user = await User.findOne({ googleId: profile.id });
-      if (user) {
-        return done(null, user);
-      }
+const client = new OAuth2Client(process.env.GOOGLE_CLIENT_ID);
+
+// Middleware to verify JWT
+const verifyToken = (req, res, next) => {
+  const token = req.header('Authorization');
+  if (!token) return res.status(401).json({ message: 'Access denied' });
+
+  try {
+    const verified = jwt.verify(token, process.env.JWT_SECRET);
+    req.user = verified;
+    next();
+  } catch (error) {
+    res.status(400).json({ message: 'Invalid token' });
+  }
+};
+
+// Traditional registration
+app.post('/api/register', async (req, res) => {
+  try {
+    const { username, password, email, country } = req.body;
+    
+    const existingUser = await User.findOne({ $or: [{ username }, { email }] });
+    if (existingUser) {
+      return res.status(400).json({ message: 'Username or email already exists' });
+    }
+
+    const salt = await bcrypt.genSalt(10);
+    const hashedPassword = await bcrypt.hash(password, salt);
+
+    const user = new User({
+      username,
+      email,
+      password: hashedPassword,
+      country
+    });
+
+    await user.save();
+
+    const token = jwt.sign({ id: user._id }, process.env.JWT_SECRET);
+    res.status(201).json({ token, userId: user._id, username: user.username });
+  } catch (error) {
+    console.error('Registration error:', error);
+    res.status(500).json({ message: 'Server error during registration' });
+  }
+});
+
+// Google OAuth
+app.post('/auth/google', async (req, res) => {
+  const { token } = req.body;
+  try {
+    const ticket = await client.verifyIdToken({
+      idToken: token,
+      audience: process.env.GOOGLE_CLIENT_ID,
+    });
+    const { sub: googleId, email, name } = ticket.getPayload();
+
+    let user = await User.findOne({ googleId });
+    if (!user) {
       user = new User({
-        username: profile.displayName,
-        googleId: profile.id,
+        googleId,
+        email,
+        username: `user_${Date.now()}`,
         country: 'Unknown'
       });
       await user.save();
-      done(null, user);
-    } catch (error) {
-      done(error, null);
     }
+
+    const jwtToken = jwt.sign({ id: user._id }, process.env.JWT_SECRET);
+    res.json({ 
+      token: jwtToken, 
+      userId: user._id,
+      username: user.username,
+      needsAdditionalInfo: !user.username || user.username.startsWith('user_') || user.country === 'Unknown'
+    });
+  } catch (error) {
+    console.error('Google auth error:', error);
+    res.status(401).json({ message: 'Invalid token' });
   }
-));
+});
+
+// Update Google user info
+app.post('/api/update-google-user', verifyToken, async (req, res) => {
+  try {
+    const { username, country } = req.body;
+    const user = await User.findByIdAndUpdate(
+      req.user.id, 
+      { username, country },
+      { new: true, runValidators: true }
+    );
+    if (!user) {
+      return res.status(404).json({ message: 'User not found' });
+    }
+    res.json({ message: 'User info updated successfully', username: user.username });
+  } catch (error) {
+    console.error('Error updating user info:', error);
+    res.status(500).json({ message: 'Server error', error: error.message });
+  }
+});
+
+// Login
+app.post('/api/login', async (req, res) => {
+  try {
+    const { username, password } = req.body;
+    const user = await User.findOne({ username });
+    if (!user) {
+      return res.status(400).json({ message: 'Invalid username or password' });
+    }
+
+    const validPassword = await bcrypt.compare(password, user.password);
+    if (!validPassword) {
+      return res.status(400).json({ message: 'Invalid username or password' });
+    }
+
+    const token = jwt.sign({ id: user._id }, process.env.JWT_SECRET);
+    res.json({ token, userId: user._id, username: user.username });
+  } catch (error) {
+    console.error('Login error:', error);
+    res.status(500).json({ message: 'Server error during login' });
+  }
+});
+
+// Get user profile
+app.get('/api/profile', verifyToken, async (req, res) => {
+  try {
+    const user = await User.findById(req.user.id).select('-password');
+    if (!user) {
+      return res.status(404).json({ message: 'User not found' });
+    }
+    res.json(user);
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+});
+
 
 
 // Match Schema
@@ -122,19 +223,6 @@ const matchSchema = new mongoose.Schema({
 
 const Match = mongoose.model('Match', matchSchema);
 
-// Middleware to verify JWT
-const verifyToken = (req, res, next) => {
-  const token = req.header('Authorization');
-  if (!token) return res.status(401).json({ message: 'Access denied' });
-
-  try {
-    const verified = jwt.verify(token, process.env.JWT_SECRET);
-    req.user = verified;
-    next();
-  } catch (error) {
-    res.status(400).json({ message: 'Invalid token' });
-  }
-};
 
 // Middleware to check if user is admin
 const isAdmin = async (req, res, next) => {
@@ -152,78 +240,7 @@ const isAdmin = async (req, res, next) => {
 
 const client = new OAuth2Client(process.env.GOOGLE_CLIENT_ID);
 
-// Google OAuth routes
-app.get('/auth/google',
-  passport.authenticate('google', { scope: ['profile', 'email'] }));
 
-app.get('/auth/google/callback', 
-  passport.authenticate('google', { failureRedirect: '/login' }),
-  (req, res) => {
-    const token = jwt.sign({ id: req.user._id }, process.env.JWT_SECRET);
-    res.redirect(`${process.env.FRONTEND_URL}?token=${token}`);
-  });
-
-// New route to update username and country
-app.post('/api/update-user-info', async (req, res) => {
-  const { userId, username, country } = req.body;
-  try {
-    const user = await User.findByIdAndUpdate(
-      userId, 
-      { username, country },
-      { new: true, runValidators: true }
-    );
-    if (!user) {
-      return res.status(404).json({ message: 'User not found' });
-    }
-    const token = jwt.sign({ id: user._id }, process.env.JWT_SECRET);
-    res.json({ message: 'User info updated successfully', token, userId: user._id });
-  } catch (error) {
-    console.error('Error updating user info:', error);
-    res.status(500).json({ message: 'Server error', error: error.message });
-  }
-});
-
-// Modified Google authentication route
-app.post('/auth/google/token', async (req, res) => {
-  const { token } = req.body;
-  try {
-    console.log('Received token:', token);
-    const ticket = await client.verifyIdToken({
-      idToken: token,
-      audience: process.env.GOOGLE_CLIENT_ID,
-    });
-    const payload = ticket.getPayload();
-    console.log('Payload:', payload);
-    const { sub: googleId, email, name } = payload;
-
-    let user = await User.findOne({ googleId });
-    if (!user) {
-      // Create a new user with a temporary username
-      user = new User({
-        username: `user_${Date.now()}`, // Temporary username
-        email,
-        googleId,
-        country: 'Unknown'
-      });
-      await user.save();
-      console.log('New user created:', user);
-    } else {
-      console.log('Existing user found:', user);
-    }
-
-    const jwtToken = jwt.sign({ id: user._id }, process.env.JWT_SECRET);
-    res.json({ 
-      token: jwtToken, 
-      userId: user._id,
-      needsUsername: !user.username || user.username.startsWith('user_'),
-      needsCountry: user.country === 'Unknown',
-      username: user.username
-    });
-  } catch (error) {
-    console.error('Error in Google authentication:', error);
-    res.status(401).json({ message: 'Invalid token', error: error.message });
-  }
-});
 
 // New route to update user's country
 app.post('/api/update-country', async (req, res) => {
@@ -293,36 +310,7 @@ app.get('/api/admin/matches', verifyToken, isAdmin, async (req, res) => {
   }
 });
 
-app.post('/api/register', async (req, res) => {
-  try {
-    const { username, password, country } = req.body;
-    
-    // Check if username already exists
-    const existingUser = await User.findOne({ username });
-    if (existingUser) {
-      return res.status(400).json({ message: 'Username already exists' });
-    }
 
-    // Hash password
-    const salt = await bcrypt.genSalt(10);
-    const hashedPassword = await bcrypt.hash(password, salt);
-
-    // Create new user
-    const user = new User({
-      username,
-      password: hashedPassword,
-      country
-    });
-
-    // Save user to database
-    await user.save();
-
-    res.status(201).json({ message: 'User registered successfully' });
-  } catch (error) {
-    console.error('Registration error:', error);
-    res.status(500).json({ message: 'Server error during registration' });
-  }
-});
 
 // New endpoint to get country-based voting statistics
 app.get('/api/country-stats', async (req, res) => {
@@ -358,31 +346,6 @@ app.get('/api/country-stats', async (req, res) => {
   }
 });
 
-// User login
-app.post('/api/login', async (req, res) => {
-  try {
-    const { username, password } = req.body;
-    
-    // Check if user exists
-    const user = await User.findOne({ username });
-    if (!user) {
-      return res.status(400).json({ message: 'Invalid username or password' });
-    }
-
-    // Check password
-    const validPassword = await bcrypt.compare(password, user.password);
-    if (!validPassword) {
-      return res.status(400).json({ message: 'Invalid username or password' });
-    }
-
-    // Create and assign token
-    const token = jwt.sign({ id: user._id }, process.env.JWT_SECRET);
-    res.json({ token, userId: user._id });
-  } catch (error) {
-    console.error('Login error:', error);
-    res.status(500).json({ message: 'Server error during login' });
-  }
-});
 
 // Update vote endpoint to store user votes and return updated percentages
 app.post('/api/vote', verifyToken, async (req, res) => {
@@ -449,18 +412,6 @@ app.get('/api/match-votes/:matchId', async (req, res) => {
   }
 });
 
-// Get user profile
-app.get('/api/profile', verifyToken, async (req, res) => {
-  try {
-    const user = await User.findById(req.user.id).select('-password');
-    if (!user) {
-      return res.status(404).json({ message: 'User not found' });
-    }
-    res.json(user);
-  } catch (error) {
-    res.status(500).json({ message: error.message });
-  }
-});
 
 // New route for user votes
 app.get('/api/user-votes', verifyToken, async (req, res) => {
