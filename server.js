@@ -226,7 +226,7 @@ app.post('/auth/google/token', async (req, res) => {
       needsCountry: !user.country
     });
   } catch (error) {
-    console.error('Error verifying Google token:', error);
+    console.error('Error in Google authentication:', error);
     res.status(401).json({ message: 'Invalid token', error: error.message });
   }
 });
