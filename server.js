@@ -198,11 +198,12 @@ app.post('/auth/google/token', async (req, res) => {
 
     let user = await User.findOne({ googleId });
     if (!user) {
+      // Create a new user with a temporary username
       user = new User({
-        username: name,  // Use the name from Google as initial username
+        username: `user_${Date.now()}`, // Temporary username
         email,
         googleId,
-        country: 'Unknown'  // Set a default country
+        country: 'Unknown'
       });
       await user.save();
       console.log('New user created:', user);
@@ -214,8 +215,9 @@ app.post('/auth/google/token', async (req, res) => {
     res.json({ 
       token: jwtToken, 
       userId: user._id,
-      needsUsername: !user.username,
-      needsCountry: user.country === 'Unknown'
+      needsUsername: !user.username || user.username.startsWith('user_'),
+      needsCountry: user.country === 'Unknown',
+      username: user.username
     });
   } catch (error) {
     console.error('Error in Google authentication:', error);
