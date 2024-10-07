@@ -238,9 +238,6 @@ const isAdmin = async (req, res, next) => {
   }
 };
 
-const client = new OAuth2Client(process.env.GOOGLE_CLIENT_ID);
-
-
 
 // New route to update user's country
 app.post('/api/update-country', async (req, res) => {
