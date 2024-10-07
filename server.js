@@ -3,6 +3,9 @@ const mongoose = require('mongoose');
 const cors = require('cors');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
+const passport = require('passport');
+const GoogleStrategy = require('passport-google-oauth20').Strategy;
+const { OAuth2Client } = require('google-auth-library');
 require('dotenv').config();
 
 const app = express();
@@ -25,11 +28,9 @@ app.use(cors({
   credentials: true
 }));
 app.use(express.json());
+app.use(passport.initialize());
 
 // MongoDB connection
-const uri = process.env.MONGODB_URI || "mongodb+srv://weknowbetteradmin:dMMZV14rCKTYLJXG@cluster0.sbr1j.mongodb.net/we?retryWrites=true&w=majority&appName=Cluster0";
-
-
 mongoose.connect(process.env.MONGODB_URI, {
   useNewUrlParser: true,
   useUnifiedTopology: true,
@@ -38,19 +39,46 @@ mongoose.connect(process.env.MONGODB_URI, {
 .then(() => console.log('MongoDB connected to "we" database'))
 .catch(err => console.log('MongoDB connection error:', err));
 
-// Update User Schema
+// Updated User Schema
 const userSchema = new mongoose.Schema({
   username: { type: String, required: true, unique: true },
-  password: { type: String, required: true },
+  email: { type: String, required: function() { return this.googleId != null; }, unique: true, sparse: true },
+  password: { type: String, required: function() { return this.googleId == null; } },
   country: { type: String, required: true },
   isAdmin: { type: Boolean, default: false },
   votes: [{
     matchId: String,
     vote: String
-  }]
+  }],
+  googleId: { type: String, unique: true, sparse: true }
 });
 
 const User = mongoose.model('User', userSchema);
+
+// Configure Passport Google Strategy
+passport.use(new GoogleStrategy({
+    clientID: process.env.GOOGLE_CLIENT_ID,
+    clientSecret: process.env.GOOGLE_CLIENT_SECRET,
+    callbackURL: "/auth/google/callback"
+  },
+  async (accessToken, refreshToken, profile, done) => {
+    try {
+      let user = await User.findOne({ googleId: profile.id });
+      if (user) {
+        return done(null, user);
+      }
+      user = new User({
+        username: profile.displayName,
+        googleId: profile.id,
+        country: 'Unknown'
+      });
+      await user.save();
+      done(null, user);
+    } catch (error) {
+      done(error, null);
+    }
+  }
+));
 
 
 // Match Schema
@@ -128,6 +156,95 @@ const isAdmin = async (req, res, next) => {
     res.status(500).json({ message: 'Server error' });
   }
 };
+
+const client = new OAuth2Client(process.env.GOOGLE_CLIENT_ID);
+
+// Google OAuth routes
+app.get('/auth/google',
+  passport.authenticate('google', { scope: ['profile', 'email'] }));
+
+app.get('/auth/google/callback', 
+  passport.authenticate('google', { failureRedirect: '/login' }),
+  (req, res) => {
+    const token = jwt.sign({ id: req.user._id }, process.env.JWT_SECRET);
+    res.redirect(`${process.env.FRONTEND_URL}?token=${token}`);
+  });
+
+// New route to update username and country
+app.post('/api/update-user-info', async (req, res) => {
+  const { userId, username, country } = req.body;
+  try {
+    const user = await User.findByIdAndUpdate(
+      userId, 
+      { username, country },
+      { new: true, runValidators: true }
+    );
+    if (!user) {
+      return res.status(404).json({ message: 'User not found' });
+    }
+    const token = jwt.sign({ id: user._id }, process.env.JWT_SECRET);
+    res.json({ message: 'User info updated successfully', token, userId: user._id });
+  } catch (error) {
+    console.error('Error updating user info:', error);
+    res.status(500).json({ message: 'Server error', error: error.message });
+  }
+});
+
+// Modified Google authentication route
+app.post('/auth/google/token', async (req, res) => {
+  const { token } = req.body;
+  try {
+    console.log('Received token:', token);
+    const ticket = await client.verifyIdToken({
+      idToken: token,
+      audience: process.env.GOOGLE_CLIENT_ID,
+    });
+    const payload = ticket.getPayload();
+    console.log('Payload:', payload);
+    const { sub: googleId, email, name } = payload;
+
+    let user = await User.findOne({ googleId });
+    if (!user) {
+      user = new User({
+        email,
+        googleId,
+        username: null,
+        country: null
+      });
+      await user.save();
+      console.log('New user created:', user);
+    } else {
+      console.log('Existing user found:', user);
+    }
+
+    const jwtToken = jwt.sign({ id: user._id }, process.env.JWT_SECRET);
+    res.json({ 
+      token: jwtToken, 
+      userId: user._id,
+      needsUsername: !user.username,
+      needsCountry: !user.country
+    });
+  } catch (error) {
+    console.error('Error verifying Google token:', error);
+    res.status(401).json({ message: 'Invalid token', error: error.message });
+  }
+});
+
+// New route to update user's country
+app.post('/api/update-country', async (req, res) => {
+  const { userId, country } = req.body;
+  try {
+    const user = await User.findByIdAndUpdate(userId, { country }, { new: true });
+    if (!user) {
+      return res.status(404).json({ message: 'User not found' });
+    }
+    res.json({ message: 'Country updated successfully', user });
+  } catch (error) {
+    console.error('Error updating country:', error);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
 
 // Admin prediction endpoint
 app.post('/api/admin/predict', verifyToken, isAdmin, async (req, res) => {
@@ -350,6 +467,35 @@ app.get('/api/profile', verifyToken, async (req, res) => {
   }
 });
 
+// New route for user votes
+app.get('/api/user-votes', verifyToken, async (req, res) => {
+  try {
+    const user = await User.findById(req.user.id);
+    if (!user) {
+      return res.status(404).json({ message: 'User not found' });
+    }
+
+    const matches = await Match.find({});
+    const matchVotes = {};
+
+    matches.forEach(match => {
+      const totalVotes = match.votes.HOME + match.votes.DRAW + match.votes.AWAY;
+      matchVotes[match.id] = {
+        percentages: {
+          HOME: Math.round((match.votes.HOME / totalVotes) * 100) || 0,
+          DRAW: Math.round((match.votes.DRAW / totalVotes) * 100) || 0,
+          AWAY: Math.round((match.votes.AWAY / totalVotes) * 100) || 0
+        },
+        userVote: user.votes.find(v => v.matchId === match.id)?.vote || null
+      };
+    });
+
+    res.json(matchVotes);
+  } catch (error) {
+    console.error('Error fetching user votes:', error);
+    res.status(500).json({ message: 'Server error fetching user votes' });
+  }
+});
 
 app.get('/api/matches', async (req, res) => {
   try {
