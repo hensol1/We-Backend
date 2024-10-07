@@ -12,22 +12,14 @@ const app = express();
 const PORT = process.env.PORT || 5000;
 
 app.use(cors({
-  origin: function(origin, callback) {
-    const allowedOrigins = [
-      'https://we-one-bay.vercel.app',
-      'https://we-one-bay.vercel.app/',
-      process.env.FRONTEND_URL,
-      'http://localhost:3000'  // For local development
-    ].filter(Boolean);
-    
-    if (!origin || allowedOrigins.indexOf(origin) !== -1) {
-      callback(null, true);
-    } else {
-      callback(new Error('Not allowed by CORS'));
-    }
-  },
+  origin: [
+    'https://we-one-bay.vercel.app',
+    'https://we-h5xdmrhrr-hensol1s-projects.vercel.app',
+    'http://localhost:3000'
+  ],
   credentials: true
 }));
+
 app.use(express.json());
 app.use(passport.initialize());
 
